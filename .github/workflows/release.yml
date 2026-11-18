@@ -92,11 +92,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both macOS targets share one runner (arm64 native, x86_64 cross):
-          # macOS arm64 runners are scarce, and one job means one queue slot.
+          # Both macOS targets share one Intel runner (x86_64 native, arm64 cross):
+          # hosted macOS arm64 runners are often unavailable; Intel ones are not.
           - name: macos
             targets: aarch64-apple-darwin x86_64-apple-darwin
-            os: macos-15
+            os: macos-15-intel
           - name: linux-musl
             targets: x86_64-unknown-linux-musl
             os: ubuntu-latest

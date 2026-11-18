@@ -1,0 +1,224 @@
+# Builds and publishes release archives for a `v*` tag. The tag must be
+# `v<Cargo.toml version>`, optionally with a pre-release suffix
+# (`v1.0.0-rc1`). Pre-release tags publish a GitHub prerelease and skip the
+# Homebrew tap update, so they work as a dry run.
+#
+# The `homebrew` job needs the `HOMEBREW_TAP_TOKEN` secret: a fine-grained PAT
+# with `contents: write` on peterkracik/homebrew-tap only.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      # A manual run must name an existing tag; without this the checkouts
+      # below would fall back to the dispatch branch.
+      - name: Check the tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent; then
+            echo "::error::tag $TAG does not exist in $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check the tag matches Cargo.toml
+        id: tag
+        run: |
+          set -eu
+          version=$(cargo pkgid | sed 's/.*[#@]//')
+          suffix=${TAG#"v$version-"}
+          if [ "$TAG" = "v$version" ]; then
+            prerelease=false
+          elif [ "$suffix" != "$TAG" ] && [ -n "$suffix" ] \
+            && printf '%s' "$suffix" | grep -Eqx '[0-9A-Za-z.-]+'; then
+            prerelease=true
+          else
+            echo "::error::tag $TAG does not match Cargo.toml $version" \
+              "(expected v$version or v$version-<suffix>)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG version=$version prerelease=$prerelease"
+
+      - name: Install shells
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        env:
+          APS_REQUIRE_SHELLS: bash,zsh,fish
+        run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      T: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Add target
+        run: rustup target add "$T"
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target "$T"
+
+      - name: Smoke test
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -eu
+          bin=./target/$T/release/aws-profile-switcher
+          "$bin" --version
+          "$bin" init zsh | grep -q 'awsprofile()'
+
+      - name: Package
+        run: |
+          set -eu
+          # Binary at the archive root; the name has no version so the
+          # Homebrew formula URLs stay predictable.
+          archive=aws-profile-switcher-$T.tar.gz
+          tar -C target/$T/release -czf "$archive" aws-profile-switcher
+          shasum -a 256 "$archive" | tee "$archive.sha256"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: aws-profile-switcher-${{ matrix.target }}
+          path: |
+            aws-profile-switcher-*.tar.gz
+            aws-profile-switcher-*.tar.gz.sha256
+
+  publish:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ needs.test.outputs.prerelease }}
+        run: |
+          set -eu
+          ls -l dist
+          gh release create "$TAG" dist/* \
+            --title "aws-profile-switcher $TAG" \
+            --generate-notes \
+            --prerelease="$PRERELEASE"
+
+  homebrew:
+    needs: [test, publish]
+    if: needs.test.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+    steps:
+      - name: Check HOMEBREW_TAP_TOKEN
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::secret HOMEBREW_TAP_TOKEN is not set." \
+              "Create a fine-grained PAT with contents:write on" \
+              "peterkracik/homebrew-tap only and add it as a repo secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Keeps its credentials: the token is needed to push the formula.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: peterkracik/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        run: |
+          set -eu
+          formula=Formula/aws-profile-switcher.rb
+          scripts/render-formula.sh "$VERSION" dist > "tap/$formula"
+          cd tap
+          git add "$formula"
+          if git diff --cached --quiet; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          bot=41898282+github-actions[bot]
+          git config user.email "$bot@users.noreply.github.com"
+          git commit -m "Update aws-profile-switcher formula to v$VERSION"
+          git push

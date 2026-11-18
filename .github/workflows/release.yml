@@ -92,15 +92,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
+          # Both macOS targets share one runner (arm64 native, x86_64 cross):
+          # macOS arm64 runners are scarce, and one job means one queue slot.
+          - name: macos
+            targets: aarch64-apple-darwin x86_64-apple-darwin
             os: macos-15
-          - target: x86_64-apple-darwin
-            os: macos-15
-          - target: x86_64-unknown-linux-musl
+          - name: linux-musl
+            targets: x86_64-unknown-linux-musl
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     env:
-      T: ${{ matrix.target }}
+      TARGETS: ${{ matrix.targets }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -109,21 +111,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - name: Add target
-        run: rustup target add "$T"
+      - name: Add targets
+        run: rustup target add $TARGETS
 
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.name == 'linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --locked --target "$T"
+        run: |
+          for T in $TARGETS; do
+            cargo build --release --locked --target "$T"
+          done
 
       - name: Smoke test
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.name == 'linux-musl'
         run: |
           set -eu
-          bin=./target/$T/release/aws-profile-switcher
+          bin=./target/x86_64-unknown-linux-musl/release/aws-profile-switcher
           "$bin" --version
           "$bin" init zsh | grep -q 'awsprofile()'
 
@@ -132,13 +137,15 @@ jobs:
           set -eu
           # Binary at the archive root; the name has no version so the
           # Homebrew formula URLs stay predictable.
-          archive=aws-profile-switcher-$T.tar.gz
-          tar -C target/$T/release -czf "$archive" aws-profile-switcher
-          shasum -a 256 "$archive" | tee "$archive.sha256"
+          for T in $TARGETS; do
+            archive=aws-profile-switcher-$T.tar.gz
+            tar -C target/$T/release -czf "$archive" aws-profile-switcher
+            shasum -a 256 "$archive" | tee "$archive.sha256"
+          done
 
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
-          name: aws-profile-switcher-${{ matrix.target }}
+          name: aws-profile-switcher-${{ matrix.name }}
           path: |
             aws-profile-switcher-*.tar.gz
             aws-profile-switcher-*.tar.gz.sha256
